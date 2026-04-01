@@ -301,6 +301,65 @@ docker run -d \
 
 `-v $(pwd)/data:/app/data` 很重要，这会把数据库和账号数据持久化到宿主机。否则容器一重启，数据也可能跟着表演消失术。
 
+## 本地 Kubernetes 部署
+
+仓库里新增了一个一键脚本，会按下面的顺序执行:
+
+1. 使用国内镜像源构建 Docker 镜像
+2. 推送到 `registry.cn-shenzhen.aliyuncs.com/longtao/`
+3. 部署到本地 k8s 的 `app` 命名空间
+
+默认镜像地址:
+
+```text
+registry.cn-shenzhen.aliyuncs.com/longtao/codex-console:<git-sha>
+```
+
+使用前建议先登录阿里云容器镜像仓库:
+
+```bash
+docker login registry.cn-shenzhen.aliyuncs.com
+```
+
+执行部署:
+
+```bash
+chmod +x scripts/deploy-local-k8s.sh
+WEBUI_ACCESS_PASSWORD='your_password' bash scripts/deploy-local-k8s.sh
+```
+
+常用可选变量:
+
+| 变量 | 说明 | 默认值 |
+| --- | --- | --- |
+| `NAMESPACE` | k8s 命名空间 | `app` |
+| `APP_NAME` | Deployment/Service 名称 | `codex-console` |
+| `IMAGE_TAG` | 镜像 tag | 当前 git 短 SHA |
+| `SERVICE_TYPE` | `NodePort` 或 `ClusterIP` | `NodePort` |
+| `NODE_PORT_WEBUI` | Web UI NodePort | `31455` |
+| `NODE_PORT_NOVNC` | noVNC NodePort | `30080` |
+| `USE_PVC` | `1` / `0` / `auto` | `auto` |
+| `STORAGE_CLASS` | 指定 PVC 使用的 StorageClass | 自动检测默认类 |
+| `SKIP_PUSH` | 只本地构建不推仓库时设为 `1` | `0` |
+
+示例:
+
+```bash
+IMAGE_TAG=latest \
+WEBUI_ACCESS_PASSWORD='change_me' \
+NODE_PORT_WEBUI=31455 \
+NODE_PORT_NOVNC=30080 \
+bash scripts/deploy-local-k8s.sh
+```
+
+说明:
+
+- Docker 构建默认使用阿里云 Debian/PyPI 镜像，Playwright 浏览器下载会优先走国内镜像源，缺失版本时自动回退官方源。
+- 如果集群里存在默认 `StorageClass`，脚本会自动给 `/app/data` 创建 PVC；否则退回到 `emptyDir`。
+- 默认暴露两个 NodePort:
+  - Web UI: `http://<节点IP>:31455`
+  - noVNC: `http://<节点IP>:30080`
+
 ## 使用远程 PostgreSQL
 
 ```bash
