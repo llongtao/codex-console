@@ -294,3 +294,48 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
     assert len(email_service.otp_requests) == 1
     assert email_service.otp_requests[0]["otp_sent_at"] is not None
     assert result.metadata["token_acquired_via_relogin"] is False
+
+
+def test_native_retrigger_login_otp_resets_attempted_codes():
+    engine = RegistrationEngine(FakeEmailService([]))
+    engine.session = type("SessionStub", (), {"cookies": {}})()
+    engine.password = "Secret123!"
+    engine.device_id = "did-1"
+
+    attempts = []
+
+    def fake_verify(stage_label="验证码", max_attempts=3, fetch_timeout=None, attempted_codes=None):
+        attempts.append({
+            "stage_label": stage_label,
+            "codes_before": set(attempted_codes or set()),
+            "codes_id": id(attempted_codes),
+        })
+        if attempted_codes is not None:
+            attempted_codes.add("111111")
+        return stage_label == "登录验证码(重发)"
+
+    engine._verify_email_otp_with_retry = fake_verify
+    engine._send_verification_code = lambda referer=None: False
+    engine._retrigger_login_otp = lambda: True
+    engine._get_workspace_id = lambda: "ws-1"
+    engine._select_workspace = lambda workspace_id: "https://auth.example.test/continue"
+    engine._follow_redirects = lambda continue_url: (
+        "http://localhost:1455/auth/callback?code=code-1&state=state-1",
+        continue_url,
+    )
+    engine._handle_oauth_callback = lambda callback_url: {
+        "account_id": "acct-1",
+        "access_token": "access-1",
+        "refresh_token": "refresh-1",
+        "id_token": "id-1",
+    }
+
+    result = RegistrationResult(success=False)
+
+    ok = engine._complete_token_exchange_native_backup(result)
+
+    assert ok is True
+    assert [item["stage_label"] for item in attempts] == ["登录验证码", "登录验证码(重发)"]
+    assert attempts[0]["codes_before"] == set()
+    assert attempts[1]["codes_before"] == set()
+    assert attempts[0]["codes_id"] != attempts[1]["codes_id"]

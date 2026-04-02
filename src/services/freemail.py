@@ -8,11 +8,13 @@ import time
 import logging
 import random
 import string
+from datetime import datetime, timezone
+from html import unescape
 from typing import Optional, Dict, Any, List
 
 from .base import BaseEmailService, EmailServiceError, EmailServiceType
 from ..core.http_client import HTTPClient, RequestConfig
-from ..config.constants import OTP_CODE_PATTERN
+from ..config.constants import OTP_CODE_PATTERN, OTP_CODE_SEMANTIC_PATTERN
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ class FreemailService(BaseEmailService):
 
         # 缓存 domain 列表
         self._domains = []
+        self._last_used_mail_ids: Dict[str, str] = {}
 
     def _get_headers(self) -> Dict[str, str]:
         """构造 admin 请求头"""
@@ -119,6 +122,113 @@ class FreemailService(BaseEmailService):
                     self._domains = domains
             except Exception as e:
                 logger.warning(f"获取 Freemail 域名列表失败: {e}")
+
+    def _strip_html(self, value: Any) -> str:
+        text = str(value or "")
+        return unescape(re.sub(r"<[^>]+>", " ", text))
+
+    def _parse_timestamp(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 1_000_000_000_000:
+                ts /= 1000.0
+            return ts if ts > 0 else None
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        if re.fullmatch(r"\d+(?:\.\d+)?", text):
+            ts = float(text)
+            if ts > 1_000_000_000_000:
+                ts /= 1000.0
+            return ts if ts > 0 else None
+
+        candidates = [text]
+        if "T" not in text and " " in text:
+            candidates.append(text.replace(" ", "T", 1))
+
+        for candidate in candidates:
+            normalized = candidate.replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc).timestamp()
+            except Exception:
+                continue
+
+        return None
+
+    def _extract_mail_timestamp(self, mail: Dict[str, Any]) -> Optional[float]:
+        for key in ("received_at", "receivedAt", "created_at", "createdAt", "timestamp", "date"):
+            ts = self._parse_timestamp(mail.get(key))
+            if ts is not None:
+                return ts
+        return None
+
+    def _extract_mail_id(self, mail: Dict[str, Any], fallback_index: int = 0) -> str:
+        for key in ("id", "mail_id", "_id"):
+            value = str(mail.get(key) or "").strip()
+            if value:
+                return value
+
+        sender = str(mail.get("sender") or mail.get("from") or "").strip()
+        subject = str(mail.get("subject") or "").strip()
+        preview = str(mail.get("preview") or mail.get("snippet") or "").strip()
+        return f"fallback-{fallback_index}-{sender}-{subject}-{preview[:64]}"
+
+    def _extract_mail_fields(self, mail: Dict[str, Any]) -> Dict[str, str]:
+        sender = str(mail.get("sender") or mail.get("from") or "").strip()
+        subject = str(mail.get("subject") or "").strip()
+        preview = self._strip_html(mail.get("preview") or mail.get("snippet") or "")
+        text_body = self._strip_html(mail.get("content") or mail.get("text") or "")
+        html_body = self._strip_html(mail.get("html_content") or mail.get("html") or "")
+        return {
+            "sender": sender,
+            "subject": subject,
+            "body": "\n".join(part for part in [preview, text_body, html_body] if part).strip(),
+        }
+
+    def _is_openai_otp_mail(self, sender: str, subject: str, body: str) -> bool:
+        sender_l = str(sender or "").lower()
+        subject_l = str(subject or "").lower()
+        body_l = str(body or "").lower()
+        blob = f"{sender_l}\n{subject_l}\n{body_l}"
+
+        if "openai" not in sender_l and "openai" not in blob:
+            return False
+
+        otp_keywords = (
+            "verification code",
+            "verify",
+            "one-time code",
+            "one time code",
+            "otp",
+            "log in",
+            "login",
+            "security code",
+            "验证码",
+        )
+        return any(keyword in blob for keyword in otp_keywords)
+
+    def _extract_otp_code(self, content: str, pattern: str) -> tuple[Optional[str], bool]:
+        text = str(content or "")
+        if not text:
+            return None, False
+
+        semantic_match = re.search(OTP_CODE_SEMANTIC_PATTERN, text, re.IGNORECASE)
+        if semantic_match:
+            return semantic_match.group(1), True
+
+        simple_match = re.search(pattern, text)
+        if simple_match:
+            return simple_match.group(1), False
+
+        return None, False
 
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -202,6 +312,9 @@ class FreemailService(BaseEmailService):
 
         start_time = time.time()
         seen_mail_ids: set = set()
+        email_key = str(email or "").strip().lower()
+        last_used_mail_id = self._last_used_mail_ids.get(email_key)
+        unknown_ts_grace_seconds = 15
 
         while time.time() - start_time < timeout:
             try:
@@ -210,49 +323,108 @@ class FreemailService(BaseEmailService):
                     time.sleep(3)
                     continue
 
-                for mail in mails:
-                    mail_id = mail.get("id")
-                    if not mail_id or mail_id in seen_mail_ids:
+                candidates: List[Dict[str, Any]] = []
+                unknown_ts_candidates: List[Dict[str, Any]] = []
+
+                for index, mail in enumerate(mails):
+                    mail_id = self._extract_mail_id(mail, fallback_index=index)
+                    if mail_id in seen_mail_ids:
+                        continue
+                    if last_used_mail_id and mail_id == last_used_mail_id:
                         continue
 
                     seen_mail_ids.add(mail_id)
 
-                    sender = str(mail.get("sender", "")).lower()
-                    subject = str(mail.get("subject", ""))
-                    preview = str(mail.get("preview", ""))
-                    
-                    content = f"{sender}\n{subject}\n{preview}"
-                    
-                    if "openai" not in content.lower():
+                    mail_ts = self._extract_mail_timestamp(mail)
+                    if otp_sent_at and mail_ts is not None and mail_ts + 2 < otp_sent_at:
                         continue
 
-                    # 尝试直接使用 Freemail 提取的验证码
-                    v_code = mail.get("verification_code")
-                    if v_code:
-                        logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {v_code}")
-                        self.update_status(True)
-                        return v_code
+                    parsed = self._extract_mail_fields(mail)
+                    sender = parsed["sender"]
+                    subject = parsed["subject"]
+                    body = parsed["body"]
+                    content = f"{sender}\n{subject}\n{body}".strip()
 
-                    # 如果没有直接提供，通过正则匹配 preview
-                    match = re.search(pattern, content)
-                    if match:
-                        code = match.group(1)
-                        logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {code}")
-                        self.update_status(True)
-                        return code
+                    looks_like_openai_otp = self._is_openai_otp_mail(sender, subject, body)
+                    verification_code = str(mail.get("verification_code") or "").strip()
+                    if verification_code and re.fullmatch(r"\d{6}", verification_code):
+                        code = verification_code
+                        semantic_hit = True
+                    else:
+                        code, semantic_hit = self._extract_otp_code(content, pattern)
 
-                    # 如果依然未找到，获取邮件详情进行匹配
-                    try:
-                        detail = self._make_request("GET", f"/api/email/{mail_id}")
-                        full_content = str(detail.get("content", "")) + "\n" + str(detail.get("html_content", ""))
-                        match = re.search(pattern, full_content)
-                        if match:
-                            code = match.group(1)
-                            logger.info(f"从 Freemail 邮箱 {email} 找到验证码: {code}")
-                            self.update_status(True)
-                            return code
-                    except Exception as e:
-                        logger.debug(f"获取 Freemail 邮件详情失败: {e}")
+                    if (not looks_like_openai_otp) or (not code):
+                        try:
+                            detail = self._make_request("GET", f"/api/email/{mail_id}")
+                            if isinstance(detail, dict):
+                                detail_ts = self._extract_mail_timestamp(detail)
+                                if detail_ts is not None:
+                                    mail_ts = detail_ts
+                                    if otp_sent_at and mail_ts + 2 < otp_sent_at:
+                                        continue
+
+                                detail_parsed = self._extract_mail_fields(detail)
+                                sender = detail_parsed["sender"] or sender
+                                subject = detail_parsed["subject"] or subject
+                                body = detail_parsed["body"] or body
+                                content = f"{sender}\n{subject}\n{body}".strip()
+                                looks_like_openai_otp = self._is_openai_otp_mail(sender, subject, body)
+
+                                detail_code = str(detail.get("verification_code") or "").strip()
+                                if detail_code and re.fullmatch(r"\d{6}", detail_code):
+                                    code = detail_code
+                                    semantic_hit = True
+                                else:
+                                    code, semantic_hit = self._extract_otp_code(content, pattern)
+                        except Exception as e:
+                            logger.debug(f"获取 Freemail 邮件详情失败: {e}")
+
+                    if (not looks_like_openai_otp) or (not code):
+                        continue
+
+                    candidate = {
+                        "mail_id": mail_id,
+                        "code": str(code),
+                        "mail_ts": mail_ts,
+                        "semantic_hit": bool(semantic_hit),
+                        "is_recent": bool(
+                            otp_sent_at and (mail_ts is not None) and (mail_ts + 2 >= otp_sent_at)
+                        ),
+                    }
+                    if otp_sent_at and mail_ts is None:
+                        unknown_ts_candidates.append(candidate)
+                    else:
+                        candidates.append(candidate)
+
+                elapsed = time.time() - start_time
+                if otp_sent_at and (not candidates) and unknown_ts_candidates and elapsed < unknown_ts_grace_seconds:
+                    time.sleep(3)
+                    continue
+
+                all_candidates = candidates + unknown_ts_candidates
+                if all_candidates:
+                    best = sorted(
+                        all_candidates,
+                        key=lambda item: (
+                            1 if item.get("is_recent") else 0,
+                            1 if item.get("mail_ts") is not None else 0,
+                            float(item.get("mail_ts") or 0.0),
+                            1 if item.get("semantic_hit") else 0,
+                        ),
+                        reverse=True,
+                    )[0]
+                    code = str(best["code"])
+                    self._last_used_mail_ids[email_key] = str(best["mail_id"])
+                    logger.info(
+                        "从 Freemail 邮箱 %s 找到验证码: %s（mail_id=%s ts=%s semantic=%s）",
+                        email,
+                        code,
+                        best["mail_id"],
+                        best.get("mail_ts"),
+                        best.get("semantic_hit"),
+                    )
+                    self.update_status(True)
+                    return code
 
             except Exception as e:
                 logger.debug(f"检查 Freemail 邮件时出错: {e}")

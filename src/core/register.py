@@ -1456,6 +1456,8 @@ class RegistrationEngine:
                 if not login_ready:
                     result.error_message = f"登录验证码重触发失败，且完整重登失败: {login_error}"
                     return False
+            login_otp_tried_codes = set()
+            self._log("已进入新的登录 OTP 挑战，重置本地已尝试验证码缓存", "warning")
             login_otp_ok = self._verify_email_otp_with_retry(
                 stage_label="登录验证码(重发)",
                 max_attempts=3,
@@ -1616,6 +1618,8 @@ class RegistrationEngine:
                 if not login_ready:
                     result.error_message = f"登录验证码重触发失败，且完整重登失败: {login_error}"
                     return False
+            login_otp_tried_codes = set()
+            self._log("已进入新的登录 OTP 挑战，重置本地已尝试验证码缓存", "warning")
 
             login_otp_ok = self._verify_email_otp_with_retry(
                 stage_label="登录验证码(重发)",
